@@ -32,13 +32,19 @@ type Cluster struct {
 	// pool is used to manage the connections returned by Get.
 	CreatePool func(address string, options ...redis.DialOption) (*redis.Pool, error)
 
-	mu         sync.RWMutex           // protects following fields
-	err        error                  // broken connection error
-	pools      map[string]*redis.Pool // created pools per node
-	masters    map[string]bool        // set of known active master nodes, kept up-to-date
-	replicas   map[string]bool        // set of known active replica nodes, kept up-to-date
-	mapping    [hashSlots][]string    // hash slot number to master and replica(s) server addresses, master is always at [0]
-	refreshing bool                   // indicates if there's a refresh in progress
+	// PoolWaitTimeMs is pool wait time in millisecond.
+	// If > 0 and the pool is at the MaxActive limit, then pool.Get() waits
+	// for the PoolWaitTimeMs millisecond  before returning invalid connection.
+	// It only works when pool.MaxActive > 0
+	PoolWaitTimeMs int
+
+	mu         sync.RWMutex         // protects following fields
+	err        error                // broken connection error
+	pools      map[string]*waitPool // created pools per node
+	masters    map[string]bool      // set of known active master nodes, kept up-to-date
+	replicas   map[string]bool      // set of known active replica nodes, kept up-to-date
+	mapping    [hashSlots][]string  // hash slot number to master and replica(s) server addresses, master is always at [0]
+	refreshing bool                 // indicates if there's a refresh in progress
 }
 
 // Refresh updates the cluster's internal mapping of hash slots
@@ -213,16 +219,18 @@ func (c *Cluster) getConnForAddr(addr string, forceDial bool) (redis.Conn, error
 	p := c.pools[addr]
 	if p == nil {
 		c.mu.Unlock()
-		pool, err := c.CreatePool(addr, c.DialOptions...)
+		rPool, err := c.CreatePool(addr, c.DialOptions...)
 		if err != nil {
 			return nil, err
 		}
+
+		pool := newWaitPool(rPool, c.PoolWaitTimeMs)
 
 		c.mu.Lock()
 		// check again, concurrent request may have set the pool in the meantime
 		if p = c.pools[addr]; p == nil {
 			if c.pools == nil {
-				c.pools = make(map[string]*redis.Pool, len(c.StartupNodes))
+				c.pools = make(map[string]*waitPool, len(c.StartupNodes))
 			}
 			c.pools[addr] = pool
 			p = pool
@@ -235,8 +243,7 @@ func (c *Cluster) getConnForAddr(addr string, forceDial bool) (redis.Conn, error
 	}
 	c.mu.Unlock()
 
-	conn := p.Get()
-	return conn, conn.Err()
+	return p.getWait()
 }
 
 var errNoNodeForSlot = errors.New("redisc: no node for slot")
